@@ -1,643 +1,716 @@
-// @ts-check
-/// <reference path="./kino.d.ts" />
-// Kino plugin: Internet Archive Audio -- free music, live concerts, audiobooks and old-time radio from archive.org.
-// The reference audio plugin (apiVersion 8). Read it top to bottom:
-//   1. archive.org client   2. texts   3. collections and lists   4. the tracks of an item   5. metadata cache
-//   6. search   7. home and browse   8. section and categories   9. episodes and resolve   10. settings form
-// Declared hosts: archive.org and *.archive.org (a download redirects to a storage node such as dn601307.us.archive.org,
-// and a wildcard does not cover its own bare domain).
+// Contenido de 1shows — plugin de Kino
+// Catálogo (películas, series, anime): API de www.1shows.org (tipo TMDB).
+// Video: servidores de viduki (la dirección del video la arma la página con sus
+//          propios scripts, así que resolve() usa el navegador oculto de Kino).
+// TV en vivo: listas IPTV de iptv-org/iptv en GitHub.
+// Todo lo que la persona lee está en español de Bogotá; los textos que el código
+// arma (títulos de filas, mensajes) siguen kino.lang.
 
-const BASE = "https://archive.org";
-// archive.org identifiers: letters, digits, dot, underscore, dash. Also a valid Kino item id.
-const VALID_ID = /^[A-Za-z0-9._-]{1,100}$/;
+const API = "https://www.1shows.org";
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const HEADERS = {
+  "User-Agent": UA,
+  Accept: "application/json, text/plain, */*",
+  "Accept-Language": "es-CO,es;q=0.9,en;q=0.8",
+  Referer: "https://www.1shows.org/",
+  Origin: "https://www.1shows.org",
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-origin",
+};
+const PROVIDERS_API = "https://api.viduki.net/embed_providers?site=1shows";
+const IPTV_RAW = "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/";
+const TMDB_IMG = "https://image.tmdb.org/t/p/";
+const CAPTURE_MATCH =
+  "m3u8|mpd|mp4|webm|mkv|mov|videoplayback|master.txt|/hls/|/media/";
 
-// ---- 1. archive.org client ------------------------------------------------------------------------------------
-
-// Throws only AFTER its first await (README section 6). archive.org answers some failures with 200 and an HTML page
-// (rate limiting) or with a JSON `error`: both are "unavailable", with a sentence the person understands.
-async function getJson(url) {
-  const r = await kino.fetch(url);
-  if (!r.ok) throw kino.error("unavailable", `archive.org answered ${r.status}`, { userMessage: t("unavailable") });
-  let body;
-  try {
-    body = await r.json();
-  } catch {
-    throw kino.error("unavailable", "archive.org answered something that is not JSON", { userMessage: t("unavailable") });
-  }
-  if (body && body.error) throw kino.error("unavailable", `archive.org: ${String(body.error).slice(0, 150)}`, { userMessage: t("unavailable") });
-  return body;
-}
-
-function poster(id) {
-  return BASE + "/services/img/" + encodeURIComponent(id);
-}
-
-function downloadUrl(id, name) {
-  return BASE + "/download/" + encodeURIComponent(id) + "/" + name.split("/").map(encodeURIComponent).join("/");
-}
-
-// archive.org metadata values are a string, an array of strings, a number or missing: one trimmed string.
-function text(v) {
-  if (Array.isArray(v)) return v.filter((x) => typeof x === "string").join(", ").trim();
-  return v == null ? "" : String(v).trim();
-}
-
-// Lowercase letters and digits only, accents folded: how two names are compared.
-function squash(s) {
-  const lower = String(s || "").toLowerCase();
-  return (typeof lower.normalize === "function" ? lower.normalize("NFKD") : lower).replace(/[^a-z0-9]/g, "");
-}
-
-const FIELDS = ["identifier", "title", "creator", "year", "collection", "mediatype"];
-
-// archive.org's search (advancedsearch.php). Docs with an identifier Kino can't use as an id are skipped.
-async function searchDocs(query, { rows, page = 1, sort = "downloads desc" }) {
-  const parts = ["q=" + encodeURIComponent(query)];
-  for (const f of FIELDS) parts.push("fl%5B%5D=" + f);
-  parts.push("sort%5B%5D=" + encodeURIComponent(sort), "rows=" + rows, "page=" + page, "output=json");
-  const body = await getJson(BASE + "/advancedsearch.php?" + parts.join("&"));
-  const docs = body && body.response && Array.isArray(body.response.docs) ? body.response.docs : [];
-  return docs.filter((d) => d && typeof d.identifier === "string" && VALID_ID.test(d.identifier));
-}
-
-// A search doc as a Kino item. `creator` may be a list ("Wonder Band, Guest"); `year` a number.
-function toItem(doc) {
-  const item = { id: doc.identifier, ref: "item:" + doc.identifier, title: text(doc.title) || doc.identifier, kind: kindOf(doc.collection), poster: poster(doc.identifier) };
-  const artist = text(doc.creator);
-  if (artist) item.artist = artist.slice(0, 200);
-  const year = parseInt(text(doc.year), 10);
-  if (year) item.year = String(year);
-  return item;
-}
-
-// ---- 2. texts -------------------------------------------------------------------------------------------------
-
-// Every text the person reads, in Spanish and English: Kino does not translate a plugin's texts. An error's sentence
-// (userMessage) names no domain and not the app: Kino hides a sentence that does and shows its own generic one. kino.lang is the
-// person's language ("es-CO"); anything that is not Spanish reads English.
-const TEXTS = {
-  es: {
-    unavailable: "El archivo no responde ahora. Intenta de nuevo en un rato.",
-    noAudio: "Este álbum no tiene audio que se pueda reproducir.",
-    gone: "Esta pista ya no está disponible.",
-    chapter: "Capítulo {n}", episode: "Episodio {n}", track: "Pista {n}",
-    q_mp3: "Normal (MP3)", q_light: "Liviana (64 kbps)", q_ogg: "Ogg Vorbis", q_flac: "Sin pérdida (FLAC)",
-    row_netlabels: "Discos de netlabels", row_books: "Audiolibros", row_radio: "Radio clásica", row_extra: "Tu colección: {name}",
-    tab_music: "Música", tab_live: "Conciertos", tab_books: "Audiolibros", tab_radio: "Radio",
-    list_top: "Más escuchados", list_new: "Recién agregados", list_78rpm: "Discos de 78 rpm",
-    heroBy: "De {artist}. El destacado de hoy.", heroPick: "El destacado de hoy.",
-    genre_jazz: "Jazz", genre_classical: "Clásica", genre_electronic: "Electrónica", genre_liverock: "Rock en vivo",
-    genre_blues: "Blues", genre_scifi: "Ciencia ficción (radio)", genre_mystery: "Misterio (radio)", genre_poetry: "Poesía",
-    genre_children: "Cuentos infantiles",
-    cacheStatus: "Caché: {n} álbumes, {kb} KB", cacheCleared: "Listo: se vació la caché",
-    badCollection: "Escribe el identificador de una colección (por ejemplo, librivoxaudio) o su dirección en archive.org",
-    emptyCollection: "Esa colección no existe o no tiene audio",
+// Los servidores de video, por si la API de proveedores no responde.
+const FALLBACK_PROVIDERS = [
+  {
+    id: "MAIN_1",
+    label: "Main 1",
+    movie: "https://www.viduki.net/1/movie/{id}?color=0278fd",
+    tv: "https://www.viduki.net/1/tv/{id}/{s}/{e}?color=0278fd",
   },
-  en: {
-    unavailable: "The archive isn't answering right now. Try again in a while.",
-    noAudio: "This album has no audio that can be played.",
-    gone: "This track is no longer available.",
-    chapter: "Chapter {n}", episode: "Episode {n}", track: "Track {n}",
-    q_mp3: "Standard (MP3)", q_light: "Light (64 kbps)", q_ogg: "Ogg Vorbis", q_flac: "Lossless (FLAC)",
-    row_netlabels: "Netlabel albums", row_books: "Audiobooks", row_radio: "Old-time radio", row_extra: "Your collection: {name}",
-    tab_music: "Music", tab_live: "Concerts", tab_books: "Audiobooks", tab_radio: "Radio",
-    list_top: "Most played", list_new: "Recently added", list_78rpm: "78 rpm records",
-    heroBy: "By {artist}. Today's pick.", heroPick: "Today's pick.",
-    genre_jazz: "Jazz", genre_classical: "Classical", genre_electronic: "Electronic", genre_liverock: "Live rock",
-    genre_blues: "Blues", genre_scifi: "Science fiction (radio)", genre_mystery: "Mystery (radio)", genre_poetry: "Poetry",
-    genre_children: "Children's stories",
-    cacheStatus: "Cache: {n} albums, {kb} KB", cacheCleared: "Done: the cache is empty",
-    badCollection: "Type an archive.org collection identifier (for example, librivoxaudio) or its address",
-    emptyCollection: "That collection doesn't exist or has no audio",
+  {
+    id: "MAIN_2",
+    label: "Main 2",
+    movie: "https://vidy.st/movie/{id}?color=0278fd&overlay=true",
+    tv: "https://vidy.st/tv/{id}/{s}/{e}?color=0278fd&episodeSelector=false&nextEpisode=false&autoplayNextEpisode=false&overlay=true",
   },
+  {
+    id: "MAIN_3",
+    label: "Main 3",
+    movie: "https://vidfast.pro/movie/{id}?autoPlay=true&title=true&poster=true&theme=0278fd",
+    tv: "https://vidfast.pro/tv/{id}/{s}/{e}?autoPlay=true&title=true&poster=true&theme=0278fd&nextButton=false&autoNext=false",
+  },
+  {
+    id: "MAIN_4",
+    label: "Main 4",
+    movie: "https://vidlink.pro/movie/{id}?primaryColor=0278fd&secondaryColor=a2a2a2&iconColor=eefdec&icons=default&player=jw&title=true&poster=true&autoplay=true&nextbutton=false",
+    tv: "https://vidlink.pro/tv/{id}/{s}/{e}?primaryColor=0278fd&secondaryColor=a2a2a2&iconColor=eefdec&icons=default&player=jw&title=true&poster=true&autoplay=true&nextbutton=false",
+  },
+  {
+    id: "MAIN_5",
+    label: "Main 5",
+    movie: "https://vidrock.to/movie/{id}?theme=0278fd&autoplay=true&autonext=false&download=false&nextbutton=false&episodeselector=false",
+    tv: "https://vidrock.to/tv/{id}/{s}/{e}?theme=0278fd&autoplay=true&autonext=false&download=false&nextbutton=false&episodeselector=false",
+  },
+  {
+    id: "MAIN_6",
+    label: "Main 6",
+    movie: "https://player.vidzee.wtf/embed/movie/{id}?color=0278fd",
+    tv: "https://player.vidzee.wtf/embed/tv/{id}/{s}/{e}?color=0278fd",
+  },
+  {
+    id: "MULTILANGUAGE",
+    label: "Multi-language",
+    movie: "https://www.viduki.net/2/movie/{id}?color=0278fd",
+    tv: "https://www.viduki.net/2/tv/{id}/{s}/{e}?color=0278fd",
+  },
+  {
+    id: "PREMIUM_EMBEDS",
+    label: "Premium embeds",
+    movie: "https://www.viduki.net/4/movie/{id}?color=0278fd",
+    tv: "https://www.viduki.net/4/tv/{id}/{s}/{e}?color=0278fd",
+  },
+];
+
+// Géneros de TMDB (los resultados de búsqueda solo traen los ids).
+const GENRE_MAP = {
+  28: "Acción",
+  12: "Aventura",
+  16: "Animación",
+  35: "Comedia",
+  80: "Crimen",
+  99: "Documental",
+  18: "Drama",
+  10751: "Familia",
+  14: "Fantasía",
+  36: "Historia",
+  27: "Terror",
+  10402: "Música",
+  9648: "Misterio",
+  10749: "Romance",
+  878: "Ciencia ficción",
+  10770: "Película de TV",
+  53: "Suspenso",
+  10752: "Bélico",
+  37: "Oeste",
+  10759: "Acción y aventura",
+  10762: "Infantil",
+  10765: "Ciencia ficción y fantasía",
+  10769: "Extranjero",
 };
 
-function t(key, vars) {
-  const lang = String(kino.lang || "").toLowerCase().startsWith("es") ? "es" : "en";
-  const template = TEXTS[lang][key] || TEXTS.es[key] || key;
-  return vars ? template.replace(/\{(\w+)\}/g, (_, k) => String(vars[k])) : template;
-}
+// Países de TV en vivo (código ISO, nombre en español).
+const COUNTRIES = [
+  ["us", "Estados Unidos", "US"],
+  ["gb", "Reino Unido", "GB"],
+  ["es", "España", "ES"],
+  ["mx", "México", "MX"],
+  ["ar", "Argentina", "AR"],
+  ["co", "Colombia", "CO"],
+  ["cl", "Chile", "CL"],
+  ["pe", "Perú", "PE"],
+  ["ve", "Venezuela", "VE"],
+  ["ec", "Ecuador", "EC"],
+  ["bo", "Bolivia", "BO"],
+  ["py", "Paraguay", "PY"],
+  ["uy", "Uruguay", "UY"],
+  ["pa", "Panamá", "PA"],
+  ["cr", "Costa Rica", "CR"],
+  ["gt", "Guatemala", "GT"],
+  ["do", "República Dominicana", "DO"],
+  ["cu", "Cuba", "CU"],
+  ["ca", "Canadá", "CA"],
+  ["br", "Brasil", "BR"],
+  ["de", "Alemania", "DE"],
+  ["fr", "Francia", "FR"],
+  ["it", "Italia", "IT"],
+  ["pt", "Portugal", "PT"],
+  ["nl", "Países Bajos", "NL"],
+  ["be", "Bélgica", "BE"],
+  ["ch", "Suiza", "CH"],
+  ["at", "Austria", "AT"],
+  ["se", "Suecia", "SE"],
+  ["no", "Noruega", "NO"],
+  ["dk", "Dinamarca", "DK"],
+  ["fi", "Finlandia", "FI"],
+  ["pl", "Polonia", "PL"],
+  ["ie", "Irlanda", "IE"],
+  ["cz", "República Checa", "CZ"],
+  ["hu", "Hungría", "HU"],
+  ["ro", "Rumania", "RO"],
+  ["bg", "Bulgaria", "BG"],
+  ["gr", "Grecia", "GR"],
+  ["hr", "Croacia", "HR"],
+  ["rs", "Serbia", "RS"],
+  ["sk", "Eslovaquia", "SK"],
+  ["si", "Eslovenia", "SI"],
+  ["ee", "Estonia", "EE"],
+  ["lv", "Letonia", "LV"],
+  ["lt", "Lituania", "LT"],
+  ["lu", "Luxemburgo", "LU"],
+  ["mt", "Malta", "MT"],
+  ["cy", "Chipre", "CY"],
+  ["is", "Islandia", "IS"],
+  ["ua", "Ucrania", "UA"],
+  ["ru", "Rusia", "RU"],
+  ["by", "Bielorrusia", "BY"],
+  ["ge", "Georgia", "GE"],
+  ["am", "Armenia", "AM"],
+  ["az", "Azerbaiyán", "AZ"],
+  ["kz", "Kazajistán", "KZ"],
+  ["jp", "Japón", "JP"],
+  ["kr", "Corea del Sur", "KR"],
+  ["cn", "China", "CN"],
+  ["tw", "Taiwán", "TW"],
+  ["hk", "Hong Kong", "HK"],
+  ["sg", "Singapur", "SG"],
+  ["my", "Malasia", "MY"],
+  ["id", "Indonesia", "ID"],
+  ["th", "Tailandia", "TH"],
+  ["vn", "Vietnam", "VN"],
+  ["ph", "Filipinas", "PH"],
+  ["in", "India", "IN"],
+  ["pk", "Pakistán", "PK"],
+  ["bd", "Bangladés", "BD"],
+  ["lk", "Sri Lanka", "LK"],
+  ["np", "Nepal", "NP"],
+  ["mn", "Mongolia", "MN"],
+  ["tr", "Turquía", "TR"],
+  ["il", "Israel", "IL"],
+  ["ae", "Emiratos Árabes", "AE"],
+  ["sa", "Arabia Saudita", "SA"],
+  ["qa", "Qatar", "QA"],
+  ["kw", "Kuwait", "KW"],
+  ["jo", "Jordania", "JO"],
+  ["lb", "Líbano", "LB"],
+  ["za", "Sudáfrica", "ZA"],
+  ["ng", "Nigeria", "NG"],
+  ["ke", "Kenia", "KE"],
+  ["gh", "Ghana", "GH"],
+  ["eg", "Egipto", "EG"],
+  ["ma", "Marruecos", "MA"],
+  ["dz", "Argelia", "DZ"],
+  ["tn", "Túnez", "TN"],
+  ["au", "Australia", "AU"],
+  ["nz", "Nueva Zelanda", "NZ"],
+];
 
-// ---- 3. collections and lists ---------------------------------------------------------------------------------
+// Filas de Inicio: identificador, título (es, en), género de Kino, endpoint de la API.
+const ROWS = [
+  ["tr-m", ["Tendencias · Películas", "Trending · Movies"], "peliculas", "trending/movie/day"],
+  ["tr-t", ["Tendencias · Series", "Trending · TV Shows"], "series", "trending/tv/day"],
+  ["pop-m", ["Populares · Películas", "Popular · Movies"], "peliculas", "movie/popular"],
+  ["np", ["En cartelera", "Now Playing"], "peliculas", "movie/now_playing"],
+  ["pop-t", ["Populares · Series", "Popular · TV Shows"], "series", "tv/popular"],
+  ["air", ["Al aire hoy", "Airing Today"], "series", "tv/airing_today"],
+  ["top-m", ["Mejor valoradas · Películas", "Top Rated · Movies"], "peliculas", "movie/top_rated"],
+  ["top-t", ["Mejor valoradas · Series", "Top Rated · TV Shows"], "series", "tv/top_rated"],
+  ["an-m", ["Anime · Películas", "Anime · Movies"], "anime", "discover/movie?with_genres=16"],
+  ["an-t", ["Anime · Series", "Anime · TV Shows"], "anime", "discover/tv?with_genres=16&with_original_language=ja"],
+];
 
-// What each archive.org collection is in Kino. An item lists many collections (favorites, curators...): the first
-// one known here decides; an item of none of them (the person's extra collection) is music.
-const KIND_OF = { netlabels: "music", "78rpm": "music", etree: "music", librivoxaudio: "podcast", oldtimeradio: "podcast" };
+// ---------- ayudantes ----------
 
-function kindOf(collections) {
-  for (const c of [].concat(collections || [])) if (KIND_OF[c]) return KIND_OF[c];
-  return "music";
-}
-
-// etree items have mediatype "etree", not "audio"; "collection" items (a band's page) are not playable.
-const MEDIA = "mediatype:(audio OR etree)";
-
-function liveShowsOn() {
-  return kino.config.get("liveShows") !== false;
-}
-
-// LibriVox items carry a language code ("spa", "eng"); the setting narrows only them.
-function collectionClause(name) {
-  const lang = kino.config.get("bookLang");
-  if (name === "librivoxaudio" && lang && lang !== "all") return `(collection:(librivoxaudio) AND language:(${lang}))`;
-  return `collection:(${name})`;
-}
-
-function allCollections() {
-  return Object.keys(KIND_OF).filter((c) => c !== "etree" || liveShowsOn());
-}
-
-function within(collections, extra) {
-  const scope = "(" + collections.map(collectionClause).join(" OR ") + ") AND " + MEDIA;
-  return extra ? `${scope} AND ${extra}` : scope;
-}
-
-// A list ref is "<scope>:<order>": "music:top", "books:new", "genre-jazz:top", "extra:new". Home rows, section rows,
-// genre tiles and "Ver más" all page through these.
-const SCOPES = {
-  music: ["netlabels", "78rpm"], netlabels: ["netlabels"], "78rpm": ["78rpm"],
-  live: ["etree"], books: ["librivoxaudio"], radio: ["oldtimeradio"],
-};
-const ORDERS = { top: "downloads desc", new: "addeddate desc" };
-// [scope, archive.org subject]. Counts measured 2026-10-06: jazz 49,778; classical 5,553; electronic 13,060; live rock
-// 13,020; blues 4,032; radio sci-fi 104; LibriVox poetry 2,834.
-const GENRES = {
-  jazz: ["music", "jazz"], classical: ["music", "classical"], electronic: ["netlabels", "electronic"],
-  liverock: ["live", "rock"], blues: ["music", "blues"], scifi: ["radio", "science fiction"],
-  mystery: ["radio", "mystery"], poetry: ["books", "poetry"], children: ["books", "children"],
-};
-
-// The person's extra collection: an identifier, or its https://archive.org/details/<id> address.
-function collectionId(raw) {
-  const s = text(raw);
-  const m = /^https:\/\/(?:www\.)?archive\.org\/details\/([A-Za-z0-9._-]{1,100})\/?(?:[?#].*)?$/.exec(s);
-  const id = m ? m[1] : s;
-  return VALID_ID.test(id) ? id : null;
-}
-
-function extraCollection() {
-  return collectionId(kino.config.get("extraCollection"));
-}
-
-// The query of a list, or null for a ref this plugin does not know or that a setting turned off.
-function listQuery(ref) {
-  const m = /^([a-z0-9-]+):(top|new)$/.exec(String(ref || ""));
-  if (!m) return null;
-  const [, scope, order] = m;
-  const sort = ORDERS[order];
-  if (scope === "extra") {
-    const id = extraCollection();
-    return id ? { query: `collection:(${id}) AND ${MEDIA}`, sort } : null;
-  }
-  const genre = scope.startsWith("genre-") ? GENRES[scope.slice(6)] : null;
-  const collections = (genre ? SCOPES[genre[0]] : SCOPES[scope] || []).filter((c) => c !== "etree" || liveShowsOn());
-  if (!collections.length) return null;
-  return { query: within(collections, genre ? `subject:(${genre[1]})` : null), sort };
-}
-
-async function listItems(ref, page, rows) {
-  const list = listQuery(ref);
-  if (!list) throw kino.error("not_found", `unknown list ${String(ref).slice(0, 60)}`);
-  return (await searchDocs(list.query, { rows, page, sort: list.sort })).map(toItem);
-}
-
-// ---- 4. the tracks of an item ---------------------------------------------------------------------------------
-
-// archive.org keeps one ORIGINAL file per track (FLAC for etree, VBR MP3 for netlabels and LibriVox, 128Kbps MP3 for
-// 78rpm) and DERIVATIVES made from it, which name it in `original`. A track is that group; each audio format in it is
-// a rendition. [rendition, preference]: inside one rendition the higher preference wins (16-bit FLAC over 24-bit,
-// which is huge for a phone).
-const RENDITIONS = { "VBR MP3": ["mp3", 250], "MP3": ["mp3", 1], "Ogg Vorbis": ["ogg", 1], "Flac": ["flac", 2], "24bit Flac": ["flac", 1] };
-
-// A file's rendition, or null when it is not audio this plugin plays. archive.org also names MP3s by bitrate ("32Kbps
-// MP3" to "320Kbps MP3"): an ORIGINAL is the track's MP3 whatever its bitrate (Dragnet's are 24 and 32 kbps); a
-// derivative of 64 kbps or less is the light copy.
-function renditionOf(f) {
-  if (RENDITIONS[f.format]) return RENDITIONS[f.format];
-  const m = /^(\d{2,3})Kbps MP3$/.exec(String(f.format || ""));
-  if (!m) return null;
-  const kbps = Number(m[1]);
-  return f.source !== "original" && kbps <= 64 ? ["light", kbps] : ["mp3", kbps];
-}
-
-// A private file (many soundboard recordings keep their FLAC original private) answers 403 to everyone: it still names
-// its track and gives it a title, but it is never offered as something to play.
-function isPrivate(f) {
-  return f.private === true || f.private === "true";
-}
-const MIMES = { mp3: "audio/mpeg", light: "audio/mpeg", ogg: "audio/ogg", flac: "audio/flac" };
-
-// A file's length: seconds ("240.9") on most originals, "mm:ss" or "h:mm:ss" ("10:40") on derivatives. 0 when unknown.
-function seconds(length) {
-  const s = text(length);
-  if (/^\d+(\.\d+)?$/.test(s)) return Number(s);
-  const m = /^(?:(\d+):)?(\d{1,2}):(\d{2})$/.exec(s);
-  return m ? Number(m[1] || 0) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0;
-}
-
-function baseName(name) {
-  return name.slice(name.lastIndexOf("/") + 1);
-}
-
-function stem(name) {
-  return baseName(name).replace(/\.[A-Za-z0-9]{2,5}$/, "");
-}
-
-// The disc of a file: a folder named "CD 2" or "Disc 2", or etree's "d2t05" in the name; else 1.
-function discOf(name) {
-  const dir = name.includes("/") ? name.slice(0, name.lastIndexOf("/")) : "";
-  const folder = /(?:^|\/)(?:cd|dis[ck])[\s_-]*(\d{1,2})(?:\D|$)/i.exec(dir);
-  if (folder) return Math.max(1, Number(folder[1]));
-  const etree = /d(\d{1,2})t\d{1,3}(?!\d)/i.exec(baseName(name));
-  return etree ? Math.max(1, Number(etree[1])) : 1;
-}
-
-// "Track 10" after "Track 9": localeCompare cannot be trusted in Kino's engine (README section 6).
-function natural(a, b) {
-  const x = a.split(/(\d+)/);
-  const y = b.split(/(\d+)/);
-  for (let i = 0; i < Math.min(x.length, y.length); i++) {
-    if (x[i] === y[i]) continue;
-    if (i % 2 === 1) return Number(x[i]) - Number(y[i]);
-    return x[i] < y[i] ? -1 : 1;
-  }
-  return x.length - y.length;
-}
-
-// The groups of an item's files, in play order: by disc, then by the `track` number ("3/15", "03"), then by name.
-// Nothing here is localized, so it can be cached (titles are finished per call, in finishTracks).
-function tracksOf(files) {
-  const list = Array.isArray(files) ? files.filter((f) => f && typeof f.name === "string") : [];
-  const byName = new Map(list.map((f) => [f.name, f]));
-  // The original a file comes from, following `original` (a 64 kbps copy may be made from a VBR one).
-  const rootOf = (f) => {
-    let cur = f;
-    for (let i = 0; i < 4 && cur.source !== "original" && cur.original && byName.has(cur.original); i++) cur = byName.get(cur.original);
-    return cur.source === "original" ? cur.name : cur.original || cur.name;
-  };
-  const groups = new Map();
-  for (const f of list) {
-    const r = renditionOf(f);
-    if (!r) continue;
-    const key = rootOf(f);
-    let g = groups.get(key);
-    if (!g) {
-      g = { key, files: {}, pref: {}, title: "", artist: "", track: 0, secs: 0, disc: discOf(key) };
-      groups.set(key, g);
-    }
-    const [rendition, pref] = r;
-    if (!isPrivate(f) && !(g.pref[rendition] >= pref)) {
-      g.files[rendition] = f.name;
-      g.pref[rendition] = pref;
-    }
-    if (!g.title) g.title = text(f.title);
-    if (!g.artist) g.artist = text(f.artist);
-    if (!g.track) g.track = parseInt(text(f.track), 10) > 0 ? parseInt(text(f.track), 10) : 0;
-    if (!g.secs) g.secs = seconds(f.length);
-  }
-  return [...groups.values()]
-    .filter((g) => Object.keys(g.files).length)
-    .map(({ pref, ...g }) => g)
-    .sort((a, b) => a.disc - b.disc || (a.track || 1e9) - (b.track || 1e9) || natural(a.key, b.key));
-}
-
-// A title from a file name: "Caruso-AddioAllaMadre.mp3" by Caruso -> "Addio Alla Madre".
-function titleFromName(name, creator) {
-  let s = stem(name);
-  const dash = s.indexOf("-");
-  if (dash > 0 && squash(creator) && squash(s.slice(0, dash)) === squash(creator)) s = s.slice(dash + 1);
-  s = s.replace(/^\d{1,3}[\s._-]+/, "").replace(/_+/g, " ").replace(/([a-z\d])([A-Z])/g, "$1 $2").replace(/([A-Z])([A-Z][a-z])/g, "$1 $2").replace(/\s+/g, " ").trim();
-  return s || stem(name);
-}
-
-// The tracks as the person reads them, numbered 1, 2, 3 inside each disc. A title that is only the file's stem
-// ("wonderland_ch_01") says nothing: an audiobook's becomes "Chapter N"; anything else is rebuilt from the file name,
-// where radio shows keep the episode's title ("Forecast 400722 The Lodger"), and a name with no word in it becomes
-// "Episode N" or "Track N". When the tracks have more than one artist (a compilation), each title starts with its own.
-function finishTracks(groups, kind, creator, book) {
-  const artists = new Set(groups.map((g) => squash(g.artist)).filter(Boolean));
-  const compilation = kind === "music" && artists.size > 1;
-  const perDisc = new Map();
-  return groups.map((g) => {
-    const number = (perDisc.get(g.disc) || 0) + 1;
-    perDisc.set(g.disc, number);
-    let title = g.title && squash(g.title) !== squash(stem(g.key)) ? g.title : "";
-    if (!title && book) title = t("chapter", { n: number });
-    if (!title) {
-      const fromName = titleFromName(g.key, creator);
-      title = /[A-Za-z\u00C0-\uFFFF]/.test(fromName) ? fromName : t(kind === "podcast" ? "episode" : "track", { n: number });
-    }
-    if (compilation && g.artist) title = `${g.artist} — ${title}`;
-    return { key: g.key, disc: g.disc, number, title, secs: g.secs, files: g.files };
-  });
-}
-
-// An item's metadata, trimmed to what this plugin uses. archive.org answers `{}` for an identifier it does not have.
-async function fetchItem(id) {
-  const body = await getJson(BASE + "/metadata/" + encodeURIComponent(id));
-  if (!body || !body.metadata) throw kino.error("not_found", `archive.org has no item ${id}`);
-  const m = body.metadata;
-  return {
-    id,
-    title: text(m.title) || id,
-    creator: text(m.creator),
-    kind: kindOf(m.collection),
-    book: [].concat(m.collection || []).includes("librivoxaudio"),
-    year: parseInt(text(m.date) || text(m.year), 10) || 0,
-    overview: plain(m.description),
-    groups: tracksOf(body.files),
-    at: Date.now(),
-  };
-}
-
-// archive.org descriptions are HTML: Kino shows plain text.
-function plain(html) {
-  return text(html)
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 2000);
-}
-
-// ---- 5. metadata cache ----------------------------------------------------------------------------------------
-
-// Opening an album and then playing each track would ask archive.org for the same metadata every time. kino.storage
-// keeps it for 24 h (ttlMs: an expired entry is gone by itself). It holds 256 KB in all, so a huge item (a radio show
-// of 500 episodes) is simply not cached, and a full storage gives up its oldest album. What is cached has no
-// localized text: the person may switch Kino's language tomorrow.
-// Versioned: a release that changes what is cached bumps it, and yesterday's entries are simply never read again.
-const CACHE_PREFIX = "meta1:";
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const CACHE_ENTRY_MAX = 48 * 1024;
-
-function cacheKeys() {
-  return kino.storage.keys().filter((k) => k.startsWith(CACHE_PREFIX));
-}
-
-function readCache(id) {
-  const raw = kino.storage.get(CACHE_PREFIX + id);
-  if (!raw) return null;
+// El idioma de la persona (Kino 0.9.54 puede ser "en-US").
+function T(es, en) {
   try {
-    return JSON.parse(raw);
-  } catch {
-    kino.storage.remove(CACHE_PREFIX + id);
-    return null;
-  }
-}
-
-function evictOldest() {
-  let victim = null;
-  let oldest = Infinity;
-  for (const key of cacheKeys()) {
-    let at = 0;
-    try {
-      at = JSON.parse(kino.storage.get(key) || "{}").at || 0;
-    } catch {
-      // unreadable: the first to go
-    }
-    if (at < oldest) {
-      oldest = at;
-      victim = key;
-    }
-  }
-  if (!victim) return false;
-  kino.storage.remove(victim);
-  return true;
-}
-
-// A cache never fails the call it serves: anything storage refuses is just not cached.
-function writeCache(id, item) {
-  const raw = JSON.stringify(item);
-  if (raw.length > CACHE_ENTRY_MAX) return;
-  for (let tries = 0; tries < 20; tries++) {
-    try {
-      kino.storage.set(CACHE_PREFIX + id, raw, { ttlMs: CACHE_TTL_MS });
-      return;
-    } catch (e) {
-      if (!e || e.code !== "too_large" || !evictOldest()) return;
-    }
-  }
-}
-
-async function itemOf(id) {
-  const cached = readCache(id);
-  if (cached) return cached;
-  const item = await fetchItem(id);
-  writeCache(id, item);
-  return item;
-}
-
-// ---- 6. search ------------------------------------------------------------------------------------------------
-
-// archive.org answers 200 with an error body when the text has a stray / - & ' or a dangling AND/OR/NOT, so only
-// letters, digits and apostrophes inside words are kept, and the operator words go.
-function cleanText(raw) {
-  return String(raw || "")
-    .replace(/[^\p{L}\p{M}\p{N}' ]+/gu, " ")
-    .replace(/(?<![\p{L}\p{M}\p{N}])'|'(?![\p{L}\p{M}\p{N}])/gu, " ")
-    .replace(/(?<![\p{L}\p{M}\p{N}])(and|or|not)(?![\p{L}\p{M}\p{N}])/giu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// One request over every enabled collection, by title and by creator (people search for "Caruso" as often as for an
-// album). `type` only orders: Kino derives it from a guess, never filter by it.
-export async function search(query) {
-  const typed = cleanText(kino.rank.shortQuery(String(query.q || "")));
-  if (!typed) return [];
-  const titles = [query.q, query.originalTitle].concat(Array.isArray(query.altTitles) ? query.altTitles : []).filter((x) => typeof x === "string" && x.trim());
-  const docs = await searchDocs(within(allCollections(), `(title:(${typed}) OR creator:(${typed}))`), { rows: 100 });
-  const words = (item) => [item.title, item.artist || ""];
-  const items = docs.map(toItem);
-  const ranked = kino.rank.sortBySimilarity(kino.rank.filterRelevant(items, titles, words), titles, words);
-  if (query.type !== "music" && query.type !== "podcast") return ranked;
-  return ranked.filter((i) => i.kind === query.type).concat(ranked.filter((i) => i.kind !== query.type));
-}
-
-// ---- 7. home and browse ---------------------------------------------------------------------------------------
-
-const ROW_SIZE = 30;
-const PAGE_SIZE = 50;
-
-// One row, or null: a row archive.org fails to answer is logged and left out, never taking the others with it.
-async function rowOf(id, ref, title, genre) {
-  try {
-    const items = await listItems(ref, 1, ROW_SIZE);
-    if (!items.length) return null;
-    const row = { id, title, ref, items };
-    if (genre) row.genre = genre;
-    return row;
+    return kino.lang === "en-US" ? en : es;
   } catch (e) {
-    kino.log(`row ${id} failed: ${e && e.message}`);
+    return es;
+  }
+}
+
+function img(path, w) {
+  return path ? TMDB_IMG + "w" + w + path : undefined;
+}
+
+function genreNames(ids) {
+  if (!Array.isArray(ids)) return undefined;
+  const out = [];
+  for (let i = 0; i < ids.length && out.length < 5; i++) {
+    const n = GENRE_MAP[ids[i]];
+    if (n && out.indexOf(n) < 0) out.push(n);
+  }
+  return out.length ? out : undefined;
+}
+
+function safeStr(v, max) {
+  if (typeof v !== "string") return undefined;
+  const s = v.trim();
+  if (!s) return undefined;
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function mimeOf(url) {
+  const u = String(url).split("?")[0].split("#")[0].toLowerCase();
+  if (u.indexOf(".m3u8") >= 0) return "application/x-mpegurl";
+  if (u.indexOf(".mpd") >= 0) return "application/dash+xml";
+  if (u.indexOf(".webm") >= 0) return "video/webm";
+  if (u.indexOf(".mkv") >= 0) return "video/x-matroska";
+  if (u.indexOf(".mov") >= 0) return "video/quicktime";
+  return "video/mp4";
+}
+
+function fmtOf(url) {
+  const u = String(url).split("?")[0].split("#")[0].toLowerCase();
+  if (u.indexOf(".srt") >= 0) return "srt";
+  return "vtt";
+}
+
+function guessLang(url) {
+  const u = String(url).toLowerCase();
+  if (u.indexOf("espa") >= 0 || u.indexOf("/es") >= 0 || u.indexOf(".es.") >= 0) return "es";
+  if (u.indexOf("eng") >= 0 || u.indexOf("/en") >= 0 || u.indexOf(".en.") >= 0) return "en";
+  return "es";
+}
+
+// Petición JSON con las cabeceras que la API de 1shows exige.
+async function fetchJson(url, headers, timeoutMs) {
+  const r = await kino.fetch(url, {
+    headers: headers || HEADERS,
+    timeoutMs: timeoutMs || 20000,
+  });
+  if (!r.ok) return null;
+  try {
+    return r.json();
+  } catch (e) {
     return null;
   }
 }
 
-// Kino allows 6 fetches in flight per plugin: never start more than `limit` at once.
-async function mapLimit(list, limit, fn) {
-  const out = new Array(list.length);
-  let next = 0;
+async function api(path, timeoutMs) {
+  const sep = path.indexOf("?") >= 0 ? "&" : "?";
+  return fetchJson(API + "/api/" + path + sep + "language=es", HEADERS, timeoutMs);
+}
+
+// Límite de peticiones en vuelo (Kino permite 6 a la vez).
+async function parallelLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let idx = 0;
   async function worker() {
-    while (next < list.length) {
-      const i = next++;
-      out[i] = await fn(list[i], i);
+    while (idx < items.length) {
+      const i = idx;
+      idx++;
+      try {
+        out[i] = await fn(items[i], i);
+      } catch (e) {
+        out[i] = null;
+      }
     }
   }
-  await Promise.all(Array.from({ length: Math.min(limit, list.length) }, worker));
+  const workers = [];
+  const n = limit < items.length ? limit : items.length;
+  for (let i = 0; i < n; i++) workers.push(worker());
+  await Promise.all(workers);
   return out;
 }
 
+// ---------- referencias ----------
+
+// Película: "m:<id>"; serie: "t:<id>"; capítulo: "e:<id>:<temporada>:<capítulo>".
+// Un servidor concreto se añade al final: "...:<servidor>".
+function mRef(id, srv) {
+  return "m:" + id + (srv ? ":" + srv : "");
+}
+function tRef(id, srv) {
+  return "t:" + id + (srv ? ":" + srv : "");
+}
+function eRef(id, s, e, srv) {
+  return "e:" + id + ":" + s + ":" + e + (srv ? ":" + srv : "");
+}
+function browseRef(endpoint) {
+  return "b:" + endpoint;
+}
+
+function parseRef(ref) {
+  if (typeof ref !== "string" || !ref) return null;
+  const parts = ref.split(":");
+  if (parts.length < 2) return null;
+  const k = parts[0];
+  if (k === "m" && parts.length >= 2) {
+    return { k: "m", id: parts[1], srv: parts.length > 2 ? parts[2] : null };
+  }
+  if (k === "t" && parts.length >= 2) {
+    return { k: "t", id: parts[1], srv: parts.length > 2 ? parts[2] : null };
+  }
+  if (k === "e" && parts.length >= 4) {
+    return {
+      k: "e",
+      id: parts[1],
+      s: parseInt(parts[2]) || 1,
+      e: parseInt(parts[3]) || 1,
+      srv: parts.length > 4 ? parts[4] : null,
+    };
+  }
+  return null;
+}
+
+// ---------- ítems ----------
+
+function toItem(r) {
+  if (!r) return null;
+  const isMovie =
+    r.media_type === "movie" ||
+    (r.media_type !== "tv" && r.title !== undefined && r.name === undefined);
+  const idNum = r.id;
+  if (typeof idNum !== "number") return null;
+  const id = (isMovie ? "m" : "t") + idNum;
+  const title = safeStr(r.title || r.name, 200);
+  if (!title) return null;
+  const item = { id: id, ref: isMovie ? mRef(idNum) : tRef(idNum), title: title, kind: isMovie ? "movie" : "series" };
+  const year = safeStr(r.release_date || r.first_air_date || "", 4);
+  if (year) item.year = year;
+  const poster = img(r.poster_path, 500);
+  if (poster) item.poster = poster;
+  const backdrop = img(r.backdrop_path, 780);
+  if (backdrop) item.backdrop = backdrop;
+  const overview = safeStr(r.overview, 2000);
+  if (overview) item.overview = overview;
+  const ot = safeStr(r.original_title || r.original_name, 200);
+  if (ot && ot !== title) item.originalTitle = ot;
+  const genres = genreNames(r.genre_ids);
+  if (genres) item.genres = genres;
+  if (typeof r.vote_average === "number" && r.vote_average > 0) item.rating = r.vote_average;
+  if (r.adult === true) item.adult = true;
+  const ids = { tmdb: idNum };
+  if (typeof r.imdb_id === "string" && r.imdb_id) ids.imdb = r.imdb_id;
+  item.ids = ids;
+  return item;
+}
+
+function mapItems(results) {
+  const out = [];
+  if (!Array.isArray(results)) return out;
+  for (let i = 0; i < results.length && out.length < 100; i++) {
+    const it = toItem(results[i]);
+    if (it) out.push(it);
+  }
+  return out;
+}
+
+// ---------- capacidades ----------
+
+export async function search(query) {
+  await null;
+  const q = safeStr(query && query.q, 200);
+  if (!q) return [];
+  const page = query && query.cursor ? parseInt(query.cursor) || 1 : 1;
+  const data = await api(
+    "search/query?query=" + encodeURIComponent(q) + "&page=" + page,
+    14000
+  );
+  if (!data) return [];
+  let items = mapItems(data.results);
+  const type = query && query.type;
+  if (type === "movie" || type === "series") {
+    const want = type === "movie" ? "movie" : "series";
+    items = items.filter(function (it) {
+      return it.kind === want;
+    });
+  }
+  if (!items.length) return [];
+  const next =
+    items.length >= 20 && page < 100 ? String(page + 1) : null;
+  return { items: items, next: next };
+}
+
 export async function home() {
-  const plan = [];
-  const extra = extraCollection();
-  if (extra) plan.push(["extra", "extra:new", t("row_extra", { name: extra })]);
-  plan.push(["netlabels", "netlabels:top", t("row_netlabels"), "musica"], ["books", "books:top", t("row_books")], ["radio", "radio:top", t("row_radio")]);
-  return (await mapLimit(plan, 4, (r) => rowOf(...r))).filter(Boolean);
+  await null;
+  const answers = await parallelLimit(ROWS, 5, function (row) {
+    return api(row[3], 15000).then(function (d) {
+      if (!d) return null;
+      const items = mapItems(d.results);
+      if (!items.length) return null;
+      return {
+        id: row[0],
+        title: T(row[1][0], row[1][1]),
+        genre: row[2],
+        items: items,
+        ref: browseRef(row[3]),
+      };
+    });
+  });
+  const rows = [];
+  for (let i = 0; i < answers.length; i++) {
+    if (answers[i]) rows.push(answers[i]);
+  }
+  return rows;
 }
 
 export async function browse(ref, cursor) {
-  const page = Math.max(1, parseInt(cursor || "1", 10) || 1);
-  const items = await listItems(ref, page, PAGE_SIZE);
-  return items.length === PAGE_SIZE ? { items, next: String(page + 1) } : { items };
+  await null;
+  if (typeof ref !== "string" || ref.slice(0, 2) !== "b:") {
+    throw kino.error("not_found", "bad-browse-ref", {
+      userMessage: T("No se encontró esta página.", "This page was not found."),
+    });
+  }
+  const endpoint = ref.slice(2);
+  const page = cursor ? parseInt(cursor) || 1 : 1;
+  const sep = endpoint.indexOf("?") >= 0 ? "&" : "?";
+  const data = await api(endpoint + sep + "page=" + page, 18000);
+  if (!data) {
+    throw kino.error("unavailable", "browse-failed", {
+      userMessage: T("No se pudo cargar esta lista.", "This list could not be loaded."),
+    });
+  }
+  const items = mapItems(data.results);
+  const next =
+    items.length >= 20 && page < 200 ? String(page + 1) : null;
+  return { items: items, next: next };
 }
 
-// ---- 8. section and categories --------------------------------------------------------------------------------
-
-// The plugin's own section (a chip on the phone's Inicio, an entry in the TV's sidebar): one tab per kind of audio.
-const TABS = {
-  music: ["music:top", "music:new", "78rpm:top"],
-  live: ["live:top", "live:new"],
-  books: ["books:top", "books:new"],
-  radio: ["radio:top", "radio:new"],
-};
-
-function listTitle(ref) {
-  return ref === "78rpm:top" ? t("list_78rpm") : t("list_" + ref.split(":")[1]);
-}
-
-// Today's pick: the same all day for everyone, a different one tomorrow (the day number picks it, not chance).
-function heroOf(items) {
-  const item = items[Math.floor(Date.now() / 86400000) % items.length];
-  const hero = { title: item.title, text: item.artist ? t("heroBy", { artist: item.artist }) : t("heroPick") };
-  if (item.poster) hero.image = item.poster;
-  return hero;
-}
-
-export async function section({ tab }) {
-  const tabs = Object.keys(TABS).filter((id) => id !== "live" || liveShowsOn()).map((id) => ({ id, label: t("tab_" + id) }));
-  const chosen = tabs.some((x) => x.id === tab) ? tab : "music";
-  const rows = (await mapLimit(TABS[chosen], 3, (ref) => rowOf(`${chosen}-${ref.replace(":", "-")}`, ref, listTitle(ref)))).filter(Boolean);
-  const answer = { tabs, tab: chosen, rows };
-  if (rows.length) answer.hero = heroOf(rows[0].items);
-  return answer;
-}
-
-// Genre tiles in Kino's Categorías. Each is asked for its most played item (its cover is the tile's art); a genre
-// with nothing, one archive.org fails to answer, or one a setting switched off is simply not offered.
-export async function categories() {
-  const tiles = await mapLimit(Object.keys(GENRES), 4, async (id) => {
-    const ref = `genre-${id}:top`;
-    if (!listQuery(ref)) return null;
-    try {
-      const [first] = await listItems(ref, 1, 1);
-      return first ? { id, title: t("genre_" + id), ref, art: first.poster } : null;
-    } catch (e) {
-      kino.log(`genre ${id} failed: ${e && e.message}`);
-      return null;
-    }
-  });
-  return tiles.filter(Boolean);
-}
-
-// ---- 9. episodes and resolve ----------------------------------------------------------------------------------
-
-function itemIdOf(ref) {
-  const m = /^item:([A-Za-z0-9._-]{1,100})$/.exec(String(ref || ""));
-  return m ? m[1] : null;
-}
-
-// "track:<id>/<file>" plays a track in the person's quality; "track:<id>/<file>|<rendition>" is one copy of it.
-function trackRefOf(ref) {
-  const m = /^track:([A-Za-z0-9._-]{1,100})\/(.+?)(?:\|(mp3|light|ogg|flac))?$/.exec(String(ref || ""));
-  return m ? { id: m[1], key: m[2], rendition: m[3] || null } : null;
-}
-
-// Kino asks this for every music and podcast item, even a single 78 rpm side: it answers one track.
 export async function episodes(ref) {
-  const id = itemIdOf(ref);
-  if (!id) throw kino.error("not_found", `not an item ref: ${String(ref).slice(0, 80)}`);
-  const item = await itemOf(id);
-  const tracks = finishTracks(item.groups, item.kind, item.creator, item.book);
-  if (!tracks.length) throw kino.error("not_found", `no playable audio in ${id}`, { userMessage: t("noAudio") });
-  const series = { title: item.title, poster: poster(id) };
-  if (item.overview) series.overview = item.overview;
-  if (item.year) series.year = String(item.year);
-  return {
-    series,
-    episodes: tracks.map((tr) => {
-      const e = { season: tr.disc, number: tr.number, ref: `track:${id}/${tr.key}`, title: tr.title, still: poster(id) };
-      if (tr.secs) e.runtimeMinutes = Math.max(1, Math.round(tr.secs / 60));
-      return e;
-    }),
-  };
+  await null;
+  const p = parseRef(ref);
+  if (!p || p.k !== "t") {
+    throw kino.error("not_found", "bad-series-ref", {
+      userMessage: T("No se encontró esta serie.", "This series was not found."),
+    });
+  }
+  const info = await api("tv/" + p.id + "?append_to_response=images", 18000);
+  if (!info || !info.name) {
+    throw kino.error("not_found", "series-missing", {
+      userMessage: T("No se encontró esta serie.", "This series was not found."),
+    });
+  }
+  const series = { title: safeStr(info.name, 200) };
+  const poster = img(info.poster_path, 500);
+  if (poster) series.poster = poster;
+  const backdrop = img(info.backdrop_path, 780);
+  if (backdrop) series.backdrop = backdrop;
+  const overview = safeStr(info.overview, 2000);
+  if (overview) series.overview = overview;
+  const g = [];
+  if (Array.isArray(info.genres)) {
+    for (let i = 0; i < info.genres.length && g.length < 5; i++) {
+      if (info.genres[i] && info.genres[i].name) g.push(info.genres[i].name);
+    }
+  }
+  if (g.length) series.genres = g;
+  const year = safeStr(info.first_air_date, 4);
+  if (year) series.year = year;
+  if (typeof info.vote_average === "number" && info.vote_average > 0) series.rating = info.vote_average;
+  const ids = { tmdb: p.id };
+  if (typeof info.imdb_id === "string" && info.imdb_id) ids.imdb = info.imdb_id;
+  series.ids = ids;
+
+  const total = Math.min(info.number_of_seasons || 0, 50);
+  const eps = [];
+  const t0 = Date.now();
+  const seasons = [];
+  for (let s = 1; s <= total; s++) seasons.push(s);
+  const results = await parallelLimit(seasons, 4, function (s) {
+    return api("tv/" + p.id + "/season/" + s, 18000);
+  });
+  for (let i = 0; i < results.length; i++) {
+    const data = results[i];
+    if (!data || !Array.isArray(data.episodes)) continue;
+    const s = seasons[i];
+    for (let j = 0; j < data.episodes.length; j++) {
+      const ep = data.episodes[j];
+      if (!ep || typeof ep.episode_number !== "number" || ep.episode_number < 1) continue;
+      const e = {
+        season: ep.season_number || s,
+        number: ep.episode_number,
+        ref: eRef(p.id, ep.season_number || s, ep.episode_number),
+      };
+      const t = safeStr(ep.name, 200);
+      if (t) e.title = t;
+      const still = img(ep.still_path, 500);
+      if (still) e.still = still;
+      const ov = safeStr(ep.overview, 2000);
+      if (ov) e.overview = ov;
+      const ad = safeStr(ep.air_date, 10);
+      if (ad && /^\d{4}-\d{2}-\d{2}$/.test(ad)) e.airDate = ad;
+      if (typeof ep.runtime === "number" && ep.runtime > 0) e.runtimeMinutes = ep.runtime;
+      eps.push(e);
+      if (eps.length >= 5000) break;
+    }
+    if (eps.length >= 5000) break;
+    if (Date.now() - t0 > 17000) break;
+  }
+  return { series: series, episodes: eps };
 }
 
-// The renditions to try, best first, for each quality setting. A missing one falls back to the next.
-const QUALITY_ORDER = {
-  standard: ["mp3", "ogg", "flac", "light"],
-  light: ["light", "mp3", "ogg", "flac"],
-  lossless: ["flac", "mp3", "ogg", "light"],
-};
+// Lista de servidores de video (con caché por si la API tarda).
+let providersCache = null;
+async function getProviders() {
+  try {
+    const r = await kino.fetch(PROVIDERS_API, {
+      headers: HEADERS,
+      timeoutMs: 12000,
+    });
+    if (r.ok) {
+      const d = r.json();
+      if (d && Array.isArray(d.providers) && d.providers.length) {
+        providersCache = d.providers;
+        return d.providers;
+      }
+    }
+  } catch (e) {
+    // La API de proveedores está protegida: usamos la lista de respaldo.
+  }
+  if (providersCache) return providersCache;
+  return FALLBACK_PROVIDERS;
+}
 
-// A track in the person's quality, with the other renditions as labelled LAZY copies (apiVersion 6): Kino shows them
-// in the player's Servidor menu and resolves one only when it is picked, used as a fallback or chosen for a download.
-// A copy's own ref ends in "|<rendition>" and resolves to exactly that file, with no copies of its own.
-export async function resolve(ref) {
-  const tr = trackRefOf(ref);
-  if (!tr) throw kino.error("not_found", `not a track ref: ${String(ref).slice(0, 80)}`);
-  const item = await itemOf(tr.id);
-  const group = item.groups.find((g) => g.key === tr.key);
-  const setting = kino.config.get("quality");
-  const order = tr.rendition ? [tr.rendition] : QUALITY_ORDER[setting] || QUALITY_ORDER.standard;
-  const rendition = group && order.find((r) => group.files[r]);
-  if (!group || !rendition) throw kino.error("not_found", `${tr.id} has no ${tr.rendition || "audio"} for ${tr.key.slice(0, 80)}`, { userMessage: t("gone") });
-  // A degraded result the author wants to hear about (telemetry): at most one report per area an hour reaches Kino.
-  // Codes only, never what the person plays (the identifier came from their library).
-  if (rendition !== order[0]) kino.log.report("quality_fallback", order[0], rendition);
-  const stream = { url: downloadUrl(tr.id, group.files[rendition]), mime: MIMES[rendition], label: t("q_" + rendition) };
-  if (group.secs) stream.durationMs = Math.round(group.secs * 1000);
-  if (!tr.rendition) {
-    const others = Object.keys(MIMES).filter((r) => r !== rendition && group.files[r]);
-    if (others.length) stream.alternatives = others.map((r) => ({ label: t("q_" + r), ref: `${ref}|${r}` }));
+function embedUrl(prov, p) {
+  const t = p.k === "m" ? prov.movie : prov.tv;
+  if (typeof t !== "string" || !t) return null;
+  return t
+    .replace("{id}", p.id)
+    .replace("{s}", String(p.s || 1))
+    .replace("{e}", String(p.e || 1));
+}
+
+function capture(embedUrlStr) {
+  const opts = {
+    timeoutMs: 20000,
+    headers: { Referer: "https://www.1shows.org/" },
+    match: CAPTURE_MATCH,
+  };
+  if (kino.browser && kino.browser.captureAll === true) {
+    opts.captureAll = true;
+  }
+  return kino.browser.capture(embedUrlStr, opts);
+}
+
+export async function resolve(ref, options) {
+  await null;
+  const p = parseRef(ref);
+  if (!p) {
+    throw kino.error("not_found", "bad-ref", {
+      userMessage: T("No se encontró este video.", "This video was not found."),
+    });
+  }
+  const providers = await getProviders();
+  if (!Array.isArray(providers) || !providers.length) {
+    throw kino.error("unavailable", "no-providers", {
+      userMessage: T("Los servidores no están disponibles ahora.", "The servers are unavailable right now."),
+    });
+  }
+  const tried = [];
+  const maxTry = p.srv ? 1 : 3;
+  let captured = null;
+  let used = null;
+  for (let i = 0; i < providers.length && tried.length < maxTry; i++) {
+    const prov = providers[i];
+    if (p.srv && prov.id !== p.srv) continue;
+    const url = embedUrl(prov, p);
+    if (!url) continue;
+    tried.push(prov.id);
+    let c = null;
+    try {
+      c = await capture(url);
+    } catch (e) {
+      c = null;
+    }
+    if (c && Array.isArray(c.media) && c.media.length) {
+      captured = c;
+      used = prov;
+      break;
+    }
+  }
+  if (!captured || !used) {
+    throw kino.error("unavailable", "no-media", {
+      userMessage: T("Este video no está disponible ahora.", "This video is unavailable right now."),
+    });
+  }
+  const m = captured.media[0];
+  const stream = { url: m.url };
+  if (m.mime) stream.mime = m.mime;
+  else stream.mime = mimeOf(m.url);
+  if (m.headers) stream.headers = m.headers;
+  // Subtítulos que la página pidió (.vtt / .srt).
+  if (Array.isArray(captured.subtitles) && captured.subtitles.length) {
+    const subs = [];
+    for (let i = 0; i < captured.subtitles.length && subs.length < 30; i++) {
+      const s = captured.subtitles[i];
+      if (s && typeof s.url === "string" && s.url) {
+        subs.push({ lang: s.lang || guessLang(s.url), url: s.url, format: fmtOf(s.url) });
+      }
+    }
+    if (subs.length) stream.subtitles = subs;
+  }
+  // Los demás servidores, como copias diferidas (la persona elige en el menú Servidor).
+  const rest = [];
+  for (let i = 0; i < providers.length && rest.length < 8; i++) {
+    if (tried.indexOf(providers[i].id) < 0) rest.push(providers[i]);
+  }
+  if (rest.length) {
+    stream.alternatives = rest.map(function (prov) {
+      const aref =
+        p.k === "m"
+          ? mRef(p.id, prov.id)
+          : p.k === "t"
+            ? tRef(p.id, prov.id)
+            : eRef(p.id, p.s, p.e, prov.id);
+      return { label: safeStr(prov.label, 48) || prov.id, ref: aref };
+    });
   }
   return stream;
 }
 
-// ---- 10. settings form ----------------------------------------------------------------------------------------
-
-// The "Estado" line (a `status` setting): Kino asks it when the form opens and after every action.
-export async function settingsStatus() {
-  const keys = cacheKeys();
-  let chars = 0;
-  for (const k of keys) chars += k.length + (kino.storage.get(k) || "").length;
-  return { cache: t("cacheStatus", { n: keys.length, kb: Math.ceil(chars / 1024) }) };
+export async function liveCategories() {
+  await null;
+  const out = [];
+  for (let i = 0; i < COUNTRIES.length; i++) {
+    out.push({ id: COUNTRIES[i][0], title: COUNTRIES[i][1], country: COUNTRIES[i][2] });
+  }
+  return out;
 }
 
-// The "Vaciar caché" button (an `action` setting). It touches only the cache, never anything else in storage.
-export async function action(key) {
-  if (key !== "clearCache") throw kino.error("not_found", `unknown action ${String(key).slice(0, 40)}`);
-  for (const k of cacheKeys()) kino.storage.remove(k);
-  return { message: t("cacheCleared") };
+const m3uCache = {};
+async function channelList(cc) {
+  if (m3uCache[cc]) return m3uCache[cc];
+  const r = await kino.fetch(IPTV_RAW + cc + ".m3u", {
+    headers: { "User-Agent": UA },
+    timeoutMs: 25000,
+  });
+  if (!r.ok) return [];
+  const text = r.text();
+  const lines = text.split("\n");
+  const out = [];
+  let name = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.indexOf("#EXTINF") === 0) {
+      const comma = line.lastIndexOf(",");
+      name = comma >= 0 ? line.slice(comma + 1).trim() : "";
+    } else if (line.indexOf("http://") === 0 || line.indexOf("https://") === 0) {
+      if (name) {
+        out.push({ id: cc + "." + out.length, title: name, url: line });
+      }
+      name = null;
+    }
+  }
+  m3uCache[cc] = out;
+  return out;
 }
 
-// Runs before Kino saves the form: an extra collection must be a real archive.org collection with audio in it.
-export async function validateSettings(values) {
-  const raw = values && typeof values.extraCollection === "string" ? values.extraCollection.trim() : "";
-  if (!raw) return null;
-  const id = collectionId(raw);
-  if (!id) return { extraCollection: t("badCollection") };
-  const docs = await searchDocs(`collection:(${id}) AND ${MEDIA}`, { rows: 1 });
-  return docs.length ? null : { extraCollection: t("emptyCollection") };
+export async function liveChannels(arg) {
+  await null;
+  const cc = arg && arg.categoryId;
+  if (!cc || !/^[a-z]{2}$/.test(cc)) {
+    throw kino.error("not_found", "bad-country", {
+      userMessage: T("No se encontró este país.", "This country was not found."),
+    });
+  }
+  const list = await channelList(cc);
+  const start = arg && arg.cursor ? parseInt(arg.cursor) || 0 : 0;
+  const page = list.slice(start, start + 500);
+  const items = page.map(function (c) {
+    return {
+      id: c.id,
+      title: c.title,
+      stream: { url: c.url, mime: "application/x-mpegurl" },
+    };
+  });
+  const next = start + 500 < list.length ? String(start + 500) : null;
+  return { items: items, next: next };
 }
